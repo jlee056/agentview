@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Secrets and local config (never commit)
+.env
+.env.*
+*.key
+*.pem
+*.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+._*
+.vscode/
+.idea/
