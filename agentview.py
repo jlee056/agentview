@@ -12,7 +12,7 @@ from pathlib import Path
 os.environ.pop("NO_COLOR", None)
 from typing import Dict, List, Optional
 
-from rich.columns import Columns
+from rich.align import Align
 from rich.console import Group
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -20,12 +20,12 @@ from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.widgets import ContentSwitcher, Footer, Label, ListItem, ListView, RichLog, Static
 
-import kitchen
 import render
-from sessions import Event, Session, active_subagents, apply_registry, discover_today, open_session, read_new, read_registry
+import room
+from sessions import Event, Session, apply_registry, discover_today, open_session, read_new, read_registry
 
 POLL_SECONDS = 2.0
-KITCHEN_FRAME_SECONDS = 0.5
+KITCHEN_FRAME_SECONDS = 0.15
 # Sidebar order: the sessions that need attention first.
 STATUS_ORDER = {"working": 0, "waiting": 1, "idle": 2}
 
@@ -112,6 +112,7 @@ class AgentView(App):
         Binding("m", "show('merged')", "Merged"),
         Binding("g", "show('grid')", "Grid"),
         Binding("k", "show('kitchen')", "Kitchen"),
+        Binding("n", "toggle_names", "Names"),
         Binding("f", "toggle_freeze", "Freeze"),
         Binding("q", "quit", "Quit"),
     ]
@@ -125,7 +126,7 @@ class AgentView(App):
         self.focused_session: Optional[str] = None
         self.last_merged_session: Optional[str] = None
         self.frozen = False
-        self.frame = 0
+        self.room = room.Room()
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar")
@@ -240,10 +241,9 @@ class AgentView(App):
     # ---- kitchen -------------------------------------------------------
 
     def tick_kitchen(self) -> None:
-        self.frame += 1
-        self.render_kitchen()
+        self.render_kitchen(step=True)
 
-    def render_kitchen(self) -> None:
+    def render_kitchen(self, step: bool = False) -> None:
         if self.query_one("#main", ContentSwitcher).current != "kitchen":
             return
         body = self.query_one("#kitchen-body", Static)
@@ -251,15 +251,13 @@ class AgentView(App):
             body.update(Text("The kitchen is closed: no Claude Code sessions today yet.", style=render.MUTED))
             return
         now = time.time()
-        ranked = sorted(self.sessions.values(), key=lambda s: STATUS_ORDER[s.status(now)])
-        counts = {"working": 0, "waiting": 0, "idle": 0}
-        cards = []
-        for session in ranked:
-            status = session.status(now)
-            counts[status] += 1
-            crew = active_subagents(session, now) if status == "working" else 0
-            cards.append(kitchen.card(session, status, self.frame, crew))
-        body.update(Group(kitchen.header(counts), Text(""), Columns(cards, padding=(0, 1))))
+        self.room.sync([(s.session_id, s.label, s.status(now)) for s in self.sessions.values()])
+        if step:
+            self.room.step()
+        header = self.room.header()
+        if body.size.width and body.size.width < room.W:
+            header.append(f"   ⚠ window too narrow: the room needs {room.W} columns", style=render.PALETTE[6])
+        body.update(Group(header, Text(""), Align.center(self.room.render()), Text(""), self.room.legend()))
 
     def _add_session(self, session: Session) -> None:
         if not self.sessions:
@@ -316,6 +314,10 @@ class AgentView(App):
         self.query_one("#main", ContentSwitcher).current = view
         self.query_one("#sidebar", ListView).index = {"merged": 0, "grid": 1, "kitchen": 2}[view]
         self.poll()
+
+    def action_toggle_names(self) -> None:
+        self.room.show_names = not self.room.show_names
+        self.render_kitchen()
 
     def action_toggle_freeze(self) -> None:
         self.frozen = not self.frozen
