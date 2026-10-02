@@ -15,6 +15,7 @@ from typing import Dict, List, Optional
 from rich.align import Align
 from rich.console import Group
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
@@ -22,7 +23,7 @@ from textual.widgets import ContentSwitcher, Footer, Label, ListItem, ListView, 
 
 import render
 import room
-from sessions import Event, Session, apply_registry, discover_today, open_session, read_new, read_registry
+from sessions import Event, Session, active_subagents, apply_registry, discover_today, open_session, read_new, read_registry
 
 POLL_SECONDS = 2.0
 KITCHEN_FRAME_SECONDS = 0.15
@@ -113,6 +114,9 @@ class AgentView(App):
         Binding("g", "show('grid')", "Grid"),
         Binding("k", "show('kitchen')", "Kitchen"),
         Binding("n", "toggle_names", "Names"),
+        Binding("s", "toggle_sound", "Sound"),
+        Binding("t", "next_chef", "Next chef"),
+        Binding("v", "view_selected", "Transcript"),
         Binding("f", "toggle_freeze", "Freeze"),
         Binding("q", "quit", "Quit"),
     ]
@@ -126,7 +130,11 @@ class AgentView(App):
         self.focused_session: Optional[str] = None
         self.last_merged_session: Optional[str] = None
         self.frozen = False
-        self.room = room.Room()
+        self.room = room.Room()  # resized to the window on first draw
+        self.sound = True
+        self.kitchen_info: Dict[str, dict] = {}
+        self._waiting_polls: Dict[str, int] = {}
+        self._polls = 0
 
     def compose(self) -> ComposeResult:
         yield Static(id="topbar")
@@ -193,11 +201,13 @@ class AgentView(App):
         for session in self.sessions.values():
             status = session.status(stamp)
             counts[status] += 1
+            self._note_status(session, status, stamp)
             self.items[session.session_id].refresh_label(stamp)
             self._set_pane_title(self.panes[session.session_id], session, status)
             if session.session_id == self.focused_session:
                 self._set_pane_title(self.query_one("#single", RichLog), session, status)
         self._sort_sidebar(stamp)
+        self._polls += 1
         self.render_kitchen()
 
         now = dt.datetime.now().strftime("%H:%M:%S")
@@ -243,6 +253,33 @@ class AgentView(App):
     def tick_kitchen(self) -> None:
         self.render_kitchen(step=True)
 
+    def _note_status(self, session: Session, status: str, now: float) -> None:
+        """Collect what the kitchen shows about a session, and chime when one newly needs you."""
+        try:
+            idle = max(0.0, now - session.path.stat().st_mtime)
+        except OSError:
+            idle = 0.0
+        self.kitchen_info[session.session_id] = {
+            "tool": session.current_tool if status == "working" else None,
+            "detail": session.current_detail,
+            "context": session.context_tokens,
+            "subs": active_subagents(session, now) if status == "working" else 0,
+            "idle": idle,
+        }
+        sid = session.session_id
+        polls = self._waiting_polls.get(sid, 0) + 1 if status == "waiting" else 0
+        self._waiting_polls[sid] = polls
+        if polls == 2 and self._polls > 2 and self.sound:  # waiting for two polls in a row = really needs you
+            self._chime()
+
+    def _chime(self) -> None:
+        try:
+            import winsound
+
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+        except Exception:
+            self.bell()
+
     def render_kitchen(self, step: bool = False) -> None:
         if self.query_one("#main", ContentSwitcher).current != "kitchen":
             return
@@ -251,13 +288,20 @@ class AgentView(App):
             body.update(Text("The kitchen is closed: no Claude Code sessions today yet.", style=render.MUTED))
             return
         now = time.time()
-        self.room.sync([(s.session_id, s.label, s.status(now)) for s in self.sessions.values()])
+        # The world grows and shrinks with the window; rebuild it when the fitting size changes.
+        cols, rows = room.fit(body.size.width, self.query_one("#kitchen").size.height - 11)
+        if (cols, rows) != (self.room.cols, self.room.rows):
+            old = self.room
+            self.room = room.Room(cols, rows)
+            self.room.name_mode, self.room.selected = old.name_mode, old.selected
+        self.room.sync([(s.session_id, s.label, s.status(now), self.kitchen_info.get(s.session_id)) for s in self.sessions.values()])
         if step:
             self.room.step()
         header = self.room.header()
-        if body.size.width and body.size.width < room.W:
-            header.append(f"   ⚠ window too narrow: the room needs {room.W} columns", style=render.PALETTE[6])
-        body.update(Group(header, Text(""), Align.center(self.room.render()), Text(""), self.room.legend()))
+        header.append(f"   ♪ sound {'on' if self.sound else 'off'}", style=render.MUTED)
+        if body.size.width and body.size.width < room.MIN_COLS * room.CELL:
+            header.append(f"   ⚠ window too narrow: needs {room.MIN_COLS * room.CELL} columns", style=render.PALETTE[6])
+        body.update(Group(header, Text(""), Align.center(self.room.render()), Text(""), self.room.details(body.size.width), Text(""), self.room.legend()))
 
     def _add_session(self, session: Session) -> None:
         if not self.sessions:
@@ -316,8 +360,40 @@ class AgentView(App):
         self.poll()
 
     def action_toggle_names(self) -> None:
-        self.room.show_names = not self.room.show_names
+        self.room.cycle_names()
         self.render_kitchen()
+
+    def action_toggle_sound(self) -> None:
+        self.sound = not self.sound
+        if self.sound:
+            self._chime()
+        self.render_kitchen()
+
+    def action_next_chef(self) -> None:
+        self.room.cycle_selection()
+        self.render_kitchen()
+
+    def action_view_selected(self) -> None:
+        sid = self.room.selected
+        if not sid:
+            return
+        for session in self.sessions.values():
+            if session.session_id == sid:
+                self._show_single(session)
+                return
+
+    def on_click(self, event: events.Click) -> None:
+        """Clicking a chef in the kitchen selects it; clicking empty floor deselects."""
+        if self.query_one("#main", ContentSwitcher).current != "kitchen":
+            return
+        region = self.query_one("#kitchen-body", Static).region
+        if not region.contains(event.screen_x, event.screen_y):
+            return
+        x = event.screen_x - region.x - max(0, (region.width - self.room.W) // 2)
+        y_line = event.screen_y - region.y - 2  # header + blank line sit above the room
+        if 0 <= x < self.room.W and 0 <= y_line < self.room.H // 2:
+            self.room.select(self.room.chef_at(x, y_line * 2 + 1))
+            self.render_kitchen()
 
     def action_toggle_freeze(self) -> None:
         self.frozen = not self.frozen
